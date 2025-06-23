@@ -7,6 +7,5 @@ Note: It does **not** contain the audio files. If running the code on your own m
 - A recommended tool for viewing and using the code is Jupyter Notebook [https://jupyter.org/]
 - Make sure to install all the required Python dependencies referenced in the files (these will throw an error in the import statement(s) if not found).
 
-
-### June 22, 2025 
-- Currently experiencing some errors with the feature extraction code, so it is not working correctly at the moment
+## Common errors 
+- to be updated.
