@@ -1,8 +1,6 @@
 # Ignore macOS system files
 .DS_Store
 
-# Ignore audio files
-audio_files/
-
+# Ignore Jupyter files
 .ipynb_checkpoints/
 __pycache__/
