@@ -4,3 +4,6 @@
 # Ignore Jupyter files
 .ipynb_checkpoints/
 __pycache__/
+
+# Ignore audio files 
+audio_files/
