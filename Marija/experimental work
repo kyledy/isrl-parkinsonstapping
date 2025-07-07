@@ -1,0 +1,24 @@
+```{r}
+#plot f0 against age for both positive and negative diagnoses
+
+library(ggplot2)
+library(dplyr)
+
+#add diagnosis columns and combine data
+positive$`professional-diagnosis` <- "Positive"
+negative$`professional-diagnosis` <- "Negative"
+
+combined <- bind_rows(positive, negative)
+
+#convert mean and age to numeric (if needed)
+combined$`F0 (mean)` <- as.numeric(as.character(combined$`F0 (mean)`))
+combined$age <- as.numeric(as.character(combined$age))
+
+#plot the data
+ggplot(combined, aes(x = age, y = `F0 (mean)`, colour = `professional-diagnosis`)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "F0 (mean) vs Age by Diagnosis",
+       x = "Age",
+       y = "F0 (mean)") +
+  theme_minimal()
+```
