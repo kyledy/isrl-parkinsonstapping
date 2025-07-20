@@ -8,7 +8,15 @@ from collections import defaultdict
 # Helper methods for feature extraction in Praat
 # Imported functions from extract_features_utils.py
 
-def clip_audio(audio, onset=0.25, offset=0.75):
+def clip_audio(audio):
+    """
+    Trim leading and trailing silence from the audio.
+    Returns the full trimmed audio (no mid-section cropping).
+    """
+    trimmed_audio, idx = librosa.effects.trim(audio)
+    return trimmed_audio, idx
+
+def clip_audio_middle(audio, onset=0.25, offset=0.75):
     """Trim audio with librosa and return the middle of the audio.
     """
     trimmed_audio, idx  = librosa.effects.trim(audio)
