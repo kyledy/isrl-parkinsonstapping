@@ -7,3 +7,6 @@ __pycache__/
 
 # Ignore audio files 
 audio_files/
+
+# Ignore parquet files
+paruqet_files/
