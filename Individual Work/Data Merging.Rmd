@@ -1,0 +1,155 @@
+---
+title: "Data Merging"
+output: html_document
+date: "2025-08-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r download}
+library(tidyverse)
+library(ggplot2)
+
+
+install.packages("arrow")
+library(arrow)
+
+```
+
+```{r}
+library(dplyr)
+
+```
+
+
+```{r parquet install}
+
+
+neg <- read_parquet("C:/Users/teger/Downloads/negative.parquet")
+pos <-read_parquet("C:/Users/teger/Downloads/positive.parquet")
+```
+
+
+```{r heads}
+
+colnames(pos)
+
+colnames(neg)
+```
+
+```{r MDS-UPDRS load}
+MDS_data <- read.csv("C:/Users/teger/Downloads/Parkinson's Data/MDS-UPDRS Data.csv")
+
+colnames(MDS_data)
+
+```
+```{r MDS-UPRS setup}
+
+
+part_one <- MDS_data %>%
+  select(healthCode, MDS.UPDRS1.1, MDS.UPDRS1.3, MDS.UPDRS1.4,
+         MDS.UPDRS1.5, MDS.UPDRS1.7, MDS.UPDRS1.8) %>%
+  mutate(sum1 = rowSums(across(starts_with("MDS.UPDRS1"))))
+
+
+
+part_two <- MDS_data %>%
+  select(healthCode, MDS.UPDRS2.1, MDS.UPDRS2.4, MDS.UPDRS2.5, MDS.UPDRS2.6, 
+         MDS.UPDRS2.7, MDS.UPDRS2.8, MDS.UPDRS2.9, MDS.UPDRS2.10, 
+         MDS.UPDRS2.12, MDS.UPDRS2.13) %>%
+  mutate(sum2 = rowSums(across(starts_with("MDS.UPDRS2"))))
+
+MD_merged_parts <- left_join(part_one %>% select(healthCode, sum1),
+                          part_two %>% select(healthCode, sum2),
+                          by = "healthCode")
+head(MD_merged_parts)
+
+```
+
+```{r Demographic load}
+demo_data <- read.csv("C:/Users/teger/Downloads/Parkinson's Data/MDS-UPDRS Data.csv")
+
+colnames(demo_data)
+
+
+```
+```{r PDQ8 Data Load}
+PD_data <- read.csv("C:/Users/teger/Downloads/Parkinson's Data/PDQ8 Survey.csv")
+
+colnames(PD_data)
+
+```
+```{r PDQ8 Score Conversion}
+
+word_map <- c(Never = 0, Occasionally = 1, Sometimes = 2, Often = 3, Always = 4)
+
+library(dplyr)
+
+PD_data <- PD_data %>%
+  mutate(across(PDQ8.1:PDQ8.8, ~ word_map[.x]))
+
+
+colnames(PD_data)
+```
+to maintain original word answers, use this instead:
+
+PD_data <- PD_data %>%
+  mutate(across(PDQ8.1:PDQ8.8, ~ word_map[.x], .names = "{.col}_num"))
+  
+  
+```{r PDQ8 score calculation}
+
+
+PD_data <- PD_data %>%
+  rowwise() %>%
+  mutate(total_score = sum(c_across(PDQ8.1:PDQ8.8), na.rm = TRUE)) %>%
+  ungroup()
+
+
+
+colnames(PD_data)
+
+```
+
+```{r Merging of Data Frames}
+
+final <- left_join(PD_data, demo_data, by = "healthCode", relationship = "many-to-many")
+
+final <- final%>%
+  left_join(pos, by = "healthCode", relationship = "many-to-many")
+
+final <- final%>%
+  left_join(neg, by = "healthCode", relationship = "many-to-many")
+
+final <- final%>%
+  left_join(MD_merged_parts, by = "healthCode", relationship = "many-to-many")
+
+
+  
+colnames(final)
+
+```
+
+PD_data, demo_data, MD_merged_parts, pos, neg, by = "healthCode"
