@@ -1,0 +1,208 @@
+---
+title: "Normalized Time + Contours"
+output: html_document
+date: "2025-09-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+```{r setup}
+
+library(arrow)  
+library(dplyr)
+library(tidyr)
+install.packages("zoo")
+library(zoo)
+
+
+neg <- read_parquet("C:/Users/teger/Downloads/negative (3).parquet")
+
+pos <- read_parquet("C:/Users/teger/Downloads/positive (2).parquet")
+```
+
+
+```{r normalization}
+
+# Compressed reference grid
+ref_grid_size <- 100
+ref_grid <- seq(0, 1000, length.out = ref_grid_size)
+ref_grid_norm <- ref_grid / max(ref_grid)
+
+interpolate_safe <- function(df, time_col = "time", id_col = "healthCode") {
+  
+  # Identify numeric columns (exclude time)
+  numeric_cols <- names(df)[sapply(df, is.numeric) & names(df) != time_col]
+  
+  subjects <- unique(df[[id_col]])
+  
+  # Pre-allocate result
+  result <- data.frame(
+    healthCode = rep(subjects, each = ref_grid_size),
+    time_std  = rep(ref_grid, times = length(subjects))
+  )
+  
+  # Initialize numeric columns
+  for(col in numeric_cols) {
+    result[[col]] <- NA
+  }
+  
+  # Loop over subjects
+  for(s in subjects) {
+    df_sub <- df[df[[id_col]] == s, ]
+    
+    # Skip subjects with <2 time points
+    if(length(unique(df_sub[[time_col]])) < 2) next
+    
+    # Normalize time
+    time_norm <- (df_sub[[time_col]] - min(df_sub[[time_col]])) /
+                 (max(df_sub[[time_col]]) - min(df_sub[[time_col]]))
+    
+    # Interpolate each numeric column
+    for(col in numeric_cols) {
+      vals <- df_sub[[col]]
+      # Only interpolate if at least 2 non-NA values
+      if(sum(!is.na(vals)) >= 2) {
+        result[result[[id_col]] == s, col] <- approx(
+          x = time_norm,
+          y = vals,
+          xout = ref_grid_norm,
+          rule = 2
+        )$y
+      } else if(sum(!is.na(vals)) == 1) {
+        # Only one value → repeat it
+        result[result[[id_col]] == s, col] <- vals[!is.na(vals)]
+      }
+      # if all NA → leave as NA
+    }
+  }
+  
+  return(result)
+}
+
+# Apply function
+neg_std <- interpolate_safe(neg)
+pos_std <- interpolate_safe(pos)
+
+
+```
+
+
+```{r neg contours}
+
+library(ggplot2)
+
+plot_numeric_with_average <- function(df, id_col = "healthCode", time_col = "time_std") {
+  
+  # Identify numeric columns (excluding ID and time)
+  numeric_cols <- names(df)[sapply(df, is.numeric) & !names(df) %in% c(id_col, time_col)]
+  
+  if(length(numeric_cols) == 0) stop("No numeric columns to plot")
+  
+  # Convert to long format
+  plot_data_long <- df %>%
+    pivot_longer(cols = all_of(numeric_cols),
+                 names_to = "variable",
+                 values_to = "value")
+  
+  # Compute average per time and variable
+  avg_data <- plot_data_long %>%
+    group_by(variable, .data[[time_col]]) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+  
+  # Generate ggplot
+  p <- ggplot(plot_data_long, aes_string(x = time_col, y = "value", group = id_col)) +
+    geom_line(alpha = 0.3, color = "blue") +                       # individual subjects
+    geom_line(data = avg_data, aes_string(x = time_col, y = "mean_value", group = NULL),
+              color = "red", size = 1.2) +                          # average
+    facet_wrap(~ variable, scales = "free_y") +
+    labs(x = "Time", y = "Value",
+         title = "Numeric Variables Over Time with Average") +
+    theme_minimal()
+  
+  print(p)  # automatically display plot
+}
+
+```
+
+```{r display neg graph}
+
+graph_n <- plot_numeric_with_average(neg_std)
+
+
+```
+
+```{r pos contours}
+
+graph_p <- plot_numeric_with_average(pos_std)
+
+
+```
+
+```{r side by side comparison}
+
+# Function to convert dataset to long format with group label
+long_with_group <- function(df, group_name, id_col = "healthCode", time_col = "time_std") {
+  
+  numeric_cols <- names(df)[sapply(df, is.numeric) & !names(df) %in% c(id_col, time_col)]
+  
+  df_long <- df %>%
+    pivot_longer(cols = all_of(numeric_cols),
+                 names_to = "variable",
+                 values_to = "value") %>%
+    mutate(group = group_name)
+  
+  return(df_long)
+}
+
+# Convert both datasets to long format
+neg_long <- long_with_group(neg_std, "neg")
+pos_long <- long_with_group(pos_std, "pos")
+
+# Combine both datasets
+combined_long <- bind_rows(neg_long, pos_long)
+
+# Compute averages per group, variable, and time
+avg_data <- combined_long %>%
+  group_by(group, variable, time_std) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Plot individual subjects + group averages
+ggplot() +
+  # Individual subjects
+  geom_line(data = combined_long,
+            aes(x = time_std, y = value, group = interaction(group, healthCode), color = group),
+            alpha = 0.2) +
+  # Group averages
+  geom_line(data = avg_data,
+            aes(x = time_std, y = mean_value, color = group),
+            size = 1.2) +
+  facet_wrap(~ variable, scales = "free_y") +
+  scale_color_manual(values = c("neg" = "blue", "pos" = "red")) +
+  labs(x = "Time", y = "Value",
+       title = "Negative vs Positive: Individual Subjects and Average Trajectories") +
+  theme_minimal()
+
+```
