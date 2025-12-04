@@ -1,0 +1,727 @@
+---
+title: "Plot by Gender Top/Bottom 10% Severity"
+output: html_document
+date: "2025-11-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r Plot by Gender Bottom 10% Severity}
+
+#this code does not generate top 10% as there are not enough values...error in way data was merged?
+
+# --- Libraries ---
+library(arrow)
+library(data.table)
+library(dplyr)
+library(DBI)
+library(duckdb)
+library(ggplot2)
+library(tidyr)
+
+```
+```{r}
+# --- 1. Load demo and MDS data ---
+demo_data <- fread("C:/Users/teger/Downloads/Parkinson's Data/Demographic Survey.csv") %>%
+  select(healthCode, gender, recordId)
+
+MDS_data <- fread("C:/Users/teger/Downloads/Parkinson's Data/MDS-UPDRS Data.csv")
+
+```
+
+```{r}
+
+part_one <- MDS_data %>%
+  select(healthCode, recordId, starts_with("MDS.UPDRS1")) %>%
+  mutate(nonmotor = rowSums(across(starts_with("MDS.UPDRS1")), na.rm = TRUE)) %>%
+  select(healthCode, recordId, nonmotor)
+
+part_two <- MDS_data %>%
+  select(healthCode, recordId, starts_with("MDS.UPDRS2")) %>%
+  mutate(motor = rowSums(across(starts_with("MDS.UPDRS2")), na.rm = TRUE)) %>%
+  select(healthCode, recordId, motor)
+
+# Aggregate MDS to one row per healthCode
+MD_unique <- left_join(part_one, part_two, by = "healthCode") %>%
+  group_by(healthCode) %>%
+  summarise(
+    motor = mean(motor, na.rm = TRUE),
+    nonmotor = mean(nonmotor, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# --- 2. Open Parquet datasets lazily ---
+neg_ds <- open_dataset("C:/Users/teger/Downloads/negative (5).parquet")
+pos_ds <- open_dataset("C:/Users/teger/Downloads/positive (4).parquet")
+
+# --- 3. DuckDB connection ---
+con <- dbConnect(duckdb::duckdb(), dbdir=":memory:")
+
+duckdb_register_arrow(con, "neg_dd", neg_ds)
+duckdb_register_arrow(con, "pos_dd", pos_ds)
+
+# --- 4. Compute min/max time lazily ---
+neg_time <- dbGetQuery(con, "SELECT MIN(time) AS tmin, MAX(time) AS tmax FROM neg_dd")
+pos_time <- dbGetQuery(con, "SELECT MIN(time) AS tmin, MAX(time) AS tmax FROM pos_dd")
+
+# --- 5. Aggregate F0-F3 per healthCode (memory-efficient) ---
+neg_summary <- dbGetQuery(con, sprintf("
+  SELECT healthCode,
+  recordId,
+         AVG(F0) AS F0,
+         AVG(F1) AS F1,
+         AVG(F2) AS F2,
+         AVG(F3) AS F3,
+         AVG((time - %f)/(%f - %f)) AS time_norm,
+         'neg' AS source
+  FROM neg_dd
+  GROUP BY recordId, healthCode
+", neg_time$tmin, neg_time$tmax, neg_time$tmin)) %>% as.data.table()
+
+pos_summary <- dbGetQuery(con, sprintf("
+  SELECT healthCode,
+  recordId,
+         AVG(F0) AS F0,
+         AVG(F1) AS F1,
+         AVG(F2) AS F2,
+         AVG(F3) AS F3,
+         AVG((time - %f)/(%f - %f)) AS time_norm,
+         'pos' AS source
+  FROM pos_dd
+  GROUP BY healthCode, recordId
+", pos_time$tmin, pos_time$tmax, pos_time$tmin)) %>% as.data.table()
+
+all_summary <- rbindlist(list(neg_summary, pos_summary), use.names = TRUE, fill = TRUE)
+
+# --- 6. Merge with demo & MDS data ---
+all_merged <- all_summary %>%
+  left_join(demo_data, by = c("healthCode", "recordId")) %>%
+  left_join(MD_unique, by = c("healthCode")) %>%
+  as.data.table()
+```
+
+```{r}
+# --- 7. Compute top/bottom 10% thresholds ---
+q_motor <- quantile(all_merged$motor, c(0.1, 0.9), na.rm = TRUE)
+q_nonmotor <- quantile(all_merged$nonmotor, c(0.1, 0.9), na.rm = TRUE)
+
+# --- 8. Keep motor_group and nonmotor_group as separate columns ---
+all_merged[, motor_group := fifelse(motor <= q_motor[1], "bottom10",
+                                    fifelse(motor >= q_motor[2], "top10", NA_character_))]
+all_merged[, nonmotor_group := fifelse(nonmotor <= q_nonmotor[1], "bottom10",
+                                       fifelse(nonmotor >= q_nonmotor[2], "top10", NA_character_))]
+
+# --- 9. Reshape for plotting ---
+plot_data <- melt(
+  all_merged,
+  id.vars = c("healthCode", "gender", "source", "F0","F1","F2","F3"),
+  measure.vars = c("motor_group","nonmotor_group"),
+  variable.name = "ScoreType",
+  value.name = "Group"
+)
+
+# --- 10. Keep only top/bottom 10% rows ---
+plot_data <- plot_data[!is.na(Group)]
+
+# --- 11. Melt F0-F3 into long format ---
+plot_data_long <- melt(
+  plot_data,
+  id.vars = c("healthCode","gender","source","ScoreType","Group"),
+  measure.vars = c("F0","F1","F2","F3"),
+  variable.name = "Feature",
+  value.name = "Value"
+)
+
+# --- 11. Plot ---
+ggplot(plot_data_long, aes(x = Group, y = Value, fill = gender)) +
+  geom_boxplot(outlier.size = 0.5) +
+  facet_grid(Feature ~ ScoreType, scales = "free_y",
+             labeller = labeller(ScoreType = c("motor_group"="Motor","nonmotor_group"="Nonmotor"))) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "F0-F3 by Top/Bottom 10% Motor and Nonmotor Scores",
+    x = "Score Group",
+    y = "Feature Value",
+    fill = "Gender"
+  ) +
+  theme(legend.position = "top")
+
+
+```
+
+```{r add demo data as table}
+
+duckdb_register(con, "demo_data", demo_data)
+duckdb_register(con, "MDS_data", MDS_data)
+
+
+```
+
+
+```{r recordId and healthCode in MDS_data overlap check}
+diagnose_overlap <- function(con, demo_data, MDS_data, neg_ds, pos_ds) {
+
+  cat("\n=============================\n")
+  cat(" COLUMN PRESENCE CHECK\n")
+  cat("=============================\n")
+
+  neg_cols <- colnames(neg_ds)
+  pos_cols <- colnames(pos_ds)
+
+  cat("neg_ds columns:\n"); print(neg_cols)
+  cat("pos_ds columns:\n"); print(pos_cols)
+
+  has_record_neg <- "recordId" %in% neg_cols
+  has_record_pos <- "recordId" %in% pos_cols
+
+  has_hc_neg <- "healthCode" %in% neg_cols
+  has_hc_pos <- "healthCode" %in% pos_cols
+
+  cat("\nContains recordId?\n")
+  print(c(neg = has_record_neg, pos = has_record_pos))
+
+  cat("\nContains healthCode?\n")
+  print(c(neg = has_hc_neg, pos = has_hc_pos))
+
+  cat("\n=============================\n")
+  cat(" DISTINCT HEALTHCODE & RECORDID\n")
+  cat("=============================\n")
+
+  # local (R) dataset counts
+  cat("\nDistinct healthCodes (demo): ", length(unique(demo_data$healthCode)))
+  cat("\nDistinct healthCodes (MDS):  ", length(unique(MDS_data$healthCode)), "\n")
+
+  # parquet (healthCode)
+  neg_hc <- dbGetQuery(con, "SELECT COUNT(DISTINCT healthCode) AS n FROM neg_dd")
+  pos_hc <- dbGetQuery(con, "SELECT COUNT(DISTINCT healthCode) AS n FROM pos_dd")
+
+  cat("\nDistinct healthCodes (neg): "); print(neg_hc)
+  cat("Distinct healthCodes (pos): "); print(pos_hc)
+
+  # recordId counts
+  if (has_record_neg) {
+    neg_rec <- dbGetQuery(con, "SELECT COUNT(DISTINCT recordId) AS n FROM neg_dd")
+    cat("Distinct recordIds (neg): "); print(neg_rec)
+  } else {
+    cat("neg_dd has NO recordId column.\n")
+  }
+
+  if (has_record_pos) {
+    pos_rec <- dbGetQuery(con, "SELECT COUNT(DISTINCT recordId) AS n FROM pos_dd")
+    cat("Distinct recordIds (pos): "); print(pos_rec)
+  } else {
+    cat("pos_dd has NO recordId column.\n")
+  }
+
+  cat("\n=============================\n")
+  cat(" HEALTHCODE OVERLAP ACROSS DATASETS\n")
+  cat("=============================\n")
+
+  # Demo ↔ MDS (R–R)
+  overlap_demo_mds <- length(intersect(demo_data$healthCode, MDS_data$healthCode))
+  cat("\nDemo ↔ MDS healthCode overlap:", overlap_demo_mds, "\n")
+
+  # Demo ↔ neg (R–DuckDB)
+  overlap_demo_neg <- dbGetQuery(con,"
+    SELECT COUNT(*) AS overlap
+    FROM (
+      SELECT DISTINCT healthCode FROM neg_dd
+      INTERSECT
+      SELECT DISTINCT healthCode FROM demo_data
+    )
+  ")
+  cat("\nDemo ↔ Neg overlap:\n"); print(overlap_demo_neg)
+
+  # Demo ↔ pos
+  overlap_demo_pos <- dbGetQuery(con,"
+    SELECT COUNT(*) AS overlap
+    FROM (
+      SELECT DISTINCT healthCode FROM pos_dd
+      INTERSECT
+      SELECT DISTINCT healthCode FROM demo_data
+    )
+  ")
+  cat("\nDemo ↔ Pos overlap:\n"); print(overlap_demo_pos)
+
+  cat("\n=============================\n")
+  cat(" RECORDID ↔ HEALTHCODE CONSISTENCY\n")
+  cat("=============================\n")
+
+  if (has_record_neg) {
+    cat("\nNeg_dd recordId–healthCode pairs:\n")
+    print(dbGetQuery(con, "
+      SELECT 
+        COUNT(*) AS total_rows,
+        COUNT(DISTINCT recordId) AS unique_records,
+        COUNT(DISTINCT healthCode) AS unique_codes,
+        COUNT(DISTINCT recordId || '-' || healthCode) AS unique_pairs
+      FROM neg_dd
+    "))
+  }
+
+  if (has_record_pos) {
+    cat("\nPos_dd recordId–healthCode pairs:\n")
+    print(dbGetQuery(con, "
+      SELECT 
+        COUNT(*) AS total_rows,
+        COUNT(DISTINCT recordId) AS unique_records,
+        COUNT(DISTINCT healthCode) AS unique_codes,
+        COUNT(DISTINCT recordId || '-' || healthCode) AS unique_pairs
+      FROM pos_dd
+    "))
+  }
+
+  cat("\n=============================\n")
+  cat(" END OF DIAGNOSTICS\n")
+  cat("=============================\n")
+}
+
+
+
+```
+
+```{r diagnostic run}
+
+
+
+diagnose_overlap(con, demo_data, MDS_data, neg_ds, pos_ds)
+
+
+
+```
+
+
+```{r recordId and healthCode in MDS_data overlap check}
+length(intersect_neg_mds)
+length(intersect_pos_mds)
+table(all_merged$motor_group)
+table(all_merged$nonmotor_group)
+
+
+```
+```{r reorganized code}
+#reorganization to include top 10% 
+#this version meant to reduce memory usage but I still ran out of storage on my computer before I could see if it actually works
+#i don't think this one accounts for normalizaiton the time values though 
+
+library(arrow)
+library(dplyr)
+library(DBI)
+library(data.table)
+library(ggplot2)
+
+# 1. Small top/bottom 10% table
+MDS_data <- fread("C:/Users/teger/Downloads/Parkinson's Data/MDS-UPDRS Data.csv")
+
+MD_scores <- MDS_data %>%
+  mutate(
+    nonmotor = rowSums(across(starts_with("MDS.UPDRS1")), na.rm = TRUE),
+    motor = rowSums(across(starts_with("MDS.UPDRS2")), na.rm = TRUE)
+  ) %>%
+  select(healthCode, recordId, motor, nonmotor)
+
+score_labels <- MD_scores %>%
+  mutate(
+    motor_group = case_when(
+      motor <= quantile(motor, 0.1, na.rm=TRUE) ~ "bottom10",
+      motor >= quantile(motor, 0.9, na.rm=TRUE) ~ "top10",
+      TRUE ~ NA_character_
+    ),
+    nonmotor_group = case_when(
+      nonmotor <= quantile(nonmotor, 0.1, na.rm=TRUE) ~ "bottom10",
+      nonmotor >= quantile(nonmotor, 0.9, na.rm=TRUE) ~ "top10",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(motor_group) | !is.na(nonmotor_group)) %>%
+  select(healthCode, motor_group, nonmotor_group)
+
+# 2. DuckDB connection
+con <- DBI::dbConnect(duckdb::duckdb(), dbdir=":memory:")
+
+# 3. Create Parquet views
+DBI::dbExecute(con, "CREATE VIEW neg AS SELECT * FROM read_parquet('C:/Users/teger/R Studio Stuff/negative (5).parquet')")
+DBI::dbExecute(con, "CREATE VIEW pos AS SELECT * FROM read_parquet('C:/Users/teger/R Studio Stuff/positive (4).parquet')")
+
+# 4. Copy score_labels to DuckDB
+copy_to(con, score_labels, "score_labels", temporary=TRUE, overwrite=TRUE)
+
+# 5. Aggregate per healthCode to reduce memory
+query <- "
+SELECT 
+  h.healthCode,
+  AVG(F0) AS F0,
+  AVG(F1) AS F1,
+  AVG(F2) AS F2,
+  AVG(F3) AS F3
+FROM (
+  SELECT * FROM neg WHERE healthCode IN (SELECT healthCode FROM score_labels)
+  UNION ALL
+  SELECT * FROM pos WHERE healthCode IN (SELECT healthCode FROM score_labels)
+) AS h
+GROUP BY h.healthCode
+"
+
+agg_data <- dbGetQuery(con, query) %>% as.data.table()
+
+# 6. Merge in motor/nonmotor labels
+agg_data <- merge(agg_data, score_labels, by="healthCode")
+
+# 7. Optional: merge gender
+demo_data <- fread("C:/Users/teger/Downloads/Parkinson's Data/Demographic Survey.csv")
+agg_data <- merge(agg_data, demo_data[, .(healthCode, gender)], by="healthCode", all.x=TRUE)
+
+# 8. Reshape for plotting
+plot_long <- melt(agg_data, id.vars=c("healthCode","gender","motor_group","nonmotor_group"),
+                  measure.vars=c("F0","F1","F2","F3"),
+                  variable.name="Feature", value.name="Value")
+
+plot_long <- melt(plot_long, id.vars=c("healthCode","gender","Feature","Value"),
+                  measure.vars=c("motor_group","nonmotor_group"),
+                  variable.name="ScoreType", value.name="Group")
+
+plot_long <- plot_long[!is.na(Group)]
+
+# 9. Plot
+ggplot(plot_long, aes(x=Group, y=Value, fill=gender)) +
+  geom_boxplot(outlier.size=0.5) +
+  facet_grid(Feature ~ ScoreType, scales="free_y") +
+  theme_minimal(base_size=14) +
+  labs(
+    title="F0-F3 by Top/Bottom 10% Motor and Nonmotor Scores",
+    x="Score Group",
+    y="Feature Value",
+    fill="Gender"
+  )
+```
+
+
+```{r diagram}
+install.packages("VennDiagram")
+install.packages("stringdist")
+library(VennDiagram)
+library(ggplot2)
+library(stringdist)
+
+
+make_venn <- function(demo_data, MDS_data, neg_vals, pos_vals) {
+
+  demo_hc <- unique(demo_data$healthCode)
+  MDS_hc  <- unique(MDS_data$healthCode)
+
+  venn.plot <- venn.diagram(
+    x = list(
+      Demo = demo_hc,
+      MDS  = MDS_hc,
+      Neg  = neg_vals,
+      Pos  = pos_vals
+    ),
+    filename = NULL,
+    fill = c("skyblue", "pink", "lightgreen", "lightyellow"),
+    alpha = 0.5,
+    cex = 1.5,
+    cat.cex = 1.5
+  )
+
+  grid::grid.newpage()
+  grid::grid.draw(venn.plot)
+}
+
+neg_vals <- dbGetQuery(con,"SELECT DISTINCT healthCode FROM neg_dd")$healthCode
+pos_vals <- dbGetQuery(con,"SELECT DISTINCT healthCode FROM pos_dd")$healthCode
+
+make_venn(demo_data, MDS_data, neg_vals, pos_vals)
+
+
+```
+```{r clean report}
+
+
+library(data.table)
+library(arrow)
+
+# --- Load datasets correctly ---
+demo <- fread("C:/Users/teger/Downloads/Parkinson's Data/Demographic Survey.csv")
+mds  <- fread("C:/Users/teger/Downloads/Parkinson's Data/MDS-UPDRS Data.csv")
+
+neg  <- as.data.table(read_parquet("C:/Users/teger/Downloads/negative (5).parquet"))
+pos  <- as.data.table(read_parquet("C:/Users/teger/Downloads/positive (4).parquet"))
+```
+
+```{r heathcode check}
+#### ============================================================
+####  1.  Missingness report for *healthCode*
+#### ============================================================
+
+# Extract healthCode only if column exists
+get_ids <- function(dt, col) {
+  if (col %in% names(dt)) unique(dt[[col]]) else character(0)
+}
+
+demo_ids <- get_ids(demo, "healthCode")
+mds_ids  <- get_ids(mds,  "healthCode")
+neg_ids  <- get_ids(neg,  "healthCode")
+pos_ids  <- get_ids(pos,  "healthCode")
+
+# Union of ALL healthCodes
+all_health <- unique(c(demo_ids, mds_ids, neg_ids, pos_ids))
+
+health_report <- data.table(
+  healthCode = all_health,
+  missing_in_demo = !(all_health %in% demo_ids),
+  missing_in_mds  = !(all_health %in% mds_ids),
+  missing_in_neg  = !(all_health %in% neg_ids),
+  missing_in_pos  = !(all_health %in% pos_ids)
+)
+
+health_report[, total_present :=
+                (!missing_in_demo) +
+                (!missing_in_mds) +
+                (!missing_in_neg) +
+                (!missing_in_pos)]
+
+health_report[, total_missing :=
+                (missing_in_demo) +
+                (missing_in_mds) +
+                (missing_in_neg) +
+                (missing_in_pos)]
+
+setorder(health_report, -total_missing)
+
+# Save
+fwrite(health_report, "missing_healthCode_report.csv")
+```
+
+```{r recordid check}
+
+#### ============================================================
+####  2.  Missingness report for *recordId*
+#### ============================================================
+
+demo_rec <- get_ids(demo, "recordId")
+mds_rec  <- get_ids(mds,  "recordId")
+neg_rec  <- get_ids(neg,  "recordId")
+pos_rec  <- get_ids(pos,  "recordId")
+
+# Union of ALL recordIds
+all_record <- unique(c(demo_rec, mds_rec, neg_rec, pos_rec))
+
+record_report <- data.table(
+  recordId = all_record,
+  missing_in_demo = !(all_record %in% demo_rec),
+  missing_in_mds  = !(all_record %in% mds_rec),
+  missing_in_neg  = !(all_record %in% neg_rec),
+  missing_in_pos  = !(all_record %in% pos_rec)
+)
+
+record_report[, total_present :=
+                (!missing_in_demo) +
+                (!missing_in_mds) +
+                (!missing_in_neg) +
+                (!missing_in_pos)]
+
+record_report[, total_missing :=
+                (missing_in_demo) +
+                (missing_in_mds) +
+                (missing_in_neg) +
+                (missing_in_pos)]
+
+setorder(record_report, -total_missing)
+
+# Save
+fwrite(record_report, "missing_recordId_report.csv")
+
+
+#### ============================================================
+####  Done
+#### ============================================================
+
+print("Generated:")
+print("- missing_healthCode_report.csv")
+print("- missing_recordId_report.csv")
+
+
+```
+
+```{r short summary}
+
+
+library(data.table)
+library(arrow)
+
+
+# Helper to safely get IDs
+get_ids <- function(dt, col) {
+  if (col %in% names(dt)) unique(dt[[col]]) else character(0)
+}
+
+# Extract IDs
+demo_h <- get_ids(demo, "healthCode");   demo_r <- get_ids(demo, "recordId")
+mds_h  <- get_ids(mds,  "healthCode");   mds_r  <- get_ids(mds,  "recordId")
+neg_h  <- get_ids(neg,  "healthCode");   neg_r  <- get_ids(neg,  "recordId")
+pos_h  <- get_ids(pos,  "healthCode");   pos_r  <- get_ids(pos,  "recordId")
+
+# Full unions
+all_healthCodes <- unique(c(demo_h, mds_h, neg_h, pos_h))
+all_recordIds   <- unique(c(demo_r, mds_r, neg_r, pos_r))
+
+# --- Summary table ---
+summary_table <- data.table(
+  dataset = c("demo", "mds", "neg", "pos"),
+
+  n_healthCode = c(length(demo_h),
+                   length(mds_h),
+                   length(neg_h),
+                   length(pos_h)),
+
+  missing_healthCode = c(sum(!all_healthCodes %in% demo_h),
+                         sum(!all_healthCodes %in% mds_h),
+                         sum(!all_healthCodes %in% neg_h),
+                         sum(!all_healthCodes %in% pos_h)),
+
+  n_recordId = c(length(demo_r),
+                 length(mds_r),
+                 length(neg_r),
+                 length(pos_r)),
+
+  missing_recordId = c(sum(!all_recordIds %in% demo_r),
+                       sum(!all_recordIds %in% mds_r),
+                       sum(!all_recordIds %in% neg_r),
+                       sum(!all_recordIds %in% pos_r))
+)
+
+# --- Count subjects present in all 4 datasets ---
+present_all_health <- sum(all_healthCodes %in% demo_h &
+                          all_healthCodes %in% mds_h &
+                          all_healthCodes %in% neg_h &
+                          all_healthCodes %in% pos_h)
+
+present_all_record <- sum(all_recordIds %in% demo_r &
+                          all_recordIds %in% mds_r &
+                          all_recordIds %in% neg_r &
+                          all_recordIds %in% pos_r)
+
+summary_table[, present_in_all_4_healthCode := present_all_health]
+summary_table[, present_in_all_4_recordId := present_all_record]
+
+# --- Print table ---
+print(summary_table)
+
+# --- Optional CSV export ---
+fwrite(summary_table, "missingness_summary_table_with_all4.csv")
+
+
+```
+
+```{r percentage }
+
+
+# Helper to safely get IDs
+get_ids <- function(dt, col) {
+  if (col %in% names(dt)) unique(dt[[col]]) else character(0)
+}
+
+# Extract IDs
+demo_h <- get_ids(demo, "healthCode");   demo_r <- get_ids(demo, "recordId")
+mds_h  <- get_ids(mds,  "healthCode");   mds_r  <- get_ids(mds,  "recordId")
+neg_h  <- get_ids(neg,  "healthCode");   neg_r  <- get_ids(neg,  "recordId")
+pos_h  <- get_ids(pos,  "healthCode");   pos_r  <- get_ids(pos,  "recordId")
+
+# --- HEALTHCODE percentage match ---
+all_health <- unique(c(demo_h, mds_h, neg_h, pos_h))
+intersection_health <- demo_h[demo_h %in% mds_h & demo_h %in% neg_h & demo_h %in% pos_h]
+
+pct_health_match <- length(intersection_health) / length(all_health) * 100
+
+# --- RECORDID percentage match ---
+all_record <- unique(c(demo_r, mds_r, neg_r, pos_r))
+intersection_record <- demo_r[demo_r %in% mds_r & demo_r %in% neg_r & demo_r %in% pos_r]
+
+pct_record_match <- length(intersection_record) / length(all_record) * 100
+
+# --- Print results ---
+cat("Percentage of healthCodes present in all 4 datasets:", round(pct_health_match, 2), "%\n")
+cat("Percentage of recordIds present in all 4 datasets:", round(pct_record_match, 2), "%\n")
+```
+
+```{r mds vs demo}
+
+
+# --- Extract IDs ---
+demo_h <- unique(demo$healthCode)
+mds_h  <- unique(mds$healthCode)
+
+demo_r <- if ("recordId" %in% names(demo)) unique(demo$recordId) else character(0)
+mds_r  <- if ("recordId" %in% names(mds)) unique(mds$recordId) else character(0)
+
+# --- HEALTHCODE Overlap Table ---
+health_overlap <- data.table(
+  category = c("Both", "Only in Demo", "Only in MDS"),
+  count = c(
+    sum(demo_h %in% mds_h),          # Both
+    sum(!(demo_h %in% mds_h)),       # Only in demo
+    sum(!(mds_h %in% demo_h))        # Only in mds
+  )
+)
+health_overlap[, pct := round(count / sum(count) * 100, 2)]
+
+# --- RECORDID Overlap Table (if exists) ---
+if (length(demo_r) > 0 && length(mds_r) > 0) {
+  record_overlap <- data.table(
+    category = c("Both", "Only in Demo", "Only in MDS"),
+    count = c(
+      sum(demo_r %in% mds_r),
+      sum(!(demo_r %in% mds_r)),
+      sum(!(mds_r %in% demo_r))
+    )
+  )
+  record_overlap[, pct := round(count / sum(count) * 100, 2)]
+} else {
+  record_overlap <- data.table(
+    category = c("Both", "Only in Demo", "Only in MDS"),
+    count = NA,
+    pct   = NA
+  )
+}
+
+# --- Print results ---
+cat("=== HEALTHCODE Overlap ===\n")
+print(health_overlap)
+cat("\n=== RECORDID Overlap ===\n")
+print(record_overlap)
+
+# --- Optional: Save as CSV ---
+fwrite(health_overlap, "demo_mds_healthcode_overlap.csv")
+fwrite(record_overlap, "demo_mds_recordid_overlap.csv")
+```
+
+```{r column name check}
+
+colnames(demo_data)
+colnames(MDS_data)
+colnames(pos_ds)
+colnames(neg_ds)
+
+```
