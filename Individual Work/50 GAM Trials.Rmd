@@ -1,0 +1,425 @@
+---
+title: "50 GAM Trials"
+output: html_document
+date: "2026-01-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+##Trial 1a
+
+
+```{r load}
+
+
+library(arrow)
+library(dplyr)
+library(tidyverse)
+
+```
+
+
+```{r 10% sample}
+
+ds <- open_dataset("C:/Users/teger/Downloads/50_data_demo_mds.parquet")
+
+# get row count (streaming, safe)
+n <- ds %>% summarise(n = n()) %>% collect() %>% pull(n)
+
+sample_10 <- ds %>%
+  head(floor(0.10 * n)) %>%
+  collect()
+```
+
+```{r collect}
+
+
+sample_10 <- sample_10 %>%
+  select(
+    recordId, time, F0, F1, F2, F3, gender, healthCode,
+    recordId_demo, recordId_mds,
+    `MDS-UPDRS1.1`, `MDS-UPDRS1.3`, `MDS-UPDRS1.4`,
+    `MDS-UPDRS1.5`, `MDS-UPDRS1.7`, `MDS-UPDRS1.8`,
+    `MDS-UPDRS2.1`, `MDS-UPDRS2.4`, `MDS-UPDRS2.5`,
+    `MDS-UPDRS2.6`, `MDS-UPDRS2.7`, `MDS-UPDRS2.8`,
+    `MDS-UPDRS2.9`, `MDS-UPDRS2.10`, `MDS-UPDRS2.12`,
+    `MDS-UPDRS2.13`
+  ) %>%
+  collect()
+```
+
+```{r rename}
+
+sample_10 <- sample_10 %>%
+  mutate(
+    MDS_UPDRS1_total = rowSums(
+      across(starts_with("MDS-UPDRS1")),
+      na.rm = TRUE
+    ),
+    MDS_UPDRS2_total = rowSums(
+      across(starts_with("MDS-UPDRS2")),
+      na.rm = TRUE
+    )
+  
+  )
+```
+
+```{r cleaning}
+
+sample_10 %>%
+  select(
+    recordId, time, F0, F1, F2, F3, gender, healthCode,
+    recordId_demo, recordId_mds, MDS_UPDRS1_total, MDS_UPDRS2_total)
+
+```
+
+
+```{r sanity filter}
+library(mgcv)
+
+
+sample_10 <- sample_10 %>%
+  mutate(
+    gender = factor(gender),
+    severity1 = as.numeric(MDS_UPDRS1_total),
+    severity2 = as.numeric(MDS_UPDRS2_total),
+    time = as.numeric(time)
+  ) %>%
+  filter(
+    !is.na(time),
+    !is.na(gender),
+    !is.na(severity1),
+    !is.na(severity2)
+  )
+```
+
+```{r fit}
+
+library(mgcv)
+
+
+sample_10 <- sample_10 %>%
+  mutate(
+    gender = factor(gender),
+    time_std = as.numeric(scale(time)),
+    severity_total = as.numeric(severity_total)
+  )
+
+gam_F0 <- gam(
+  F0 ~ 
+    gender +
+    s(time_std, k = 8) +
+    s(severity_total, k = 6) +
+    ti(time_std, severity_total, k = c(6, 5)) +
+    gender:severity_total,
+  data   = sample_10,
+  method = "REML"
+  
+)
+
+#did not have enough memory to run this last chunk
+```
+
+
+
+##Trial 1b
+
+```{r bam replacement for memory efficiency}
+
+
+features <- c("F0", "F1", "F2", "F3")
+
+bams <- lapply(features, function(f) {
+  bam(
+    as.formula(paste0(
+      f, " ~ s(time_std, k=8) + ",
+      "s(severity_total, k=6) + ",
+      "ti(time_std, severity_total, k=c(6,5)) + ",
+      "gender + gender:severity_total"
+    )),
+    data = sample_10,
+    method = "fREML",
+    discrete = TRUE
+  )
+})
+
+names(bams) <- features
+
+```
+
+
+```{r prep}
+
+
+library(mgcv)
+
+sample_10 <- sample_10 %>%
+  mutate(
+    gender = factor(gender),
+    time_std = as.numeric(scale(time)),
+    severity_total = as.numeric(severity_total)
+  ) %>%
+  filter(
+    !is.na(F0), !is.na(F1), !is.na(F2), !is.na(F3),
+    !is.na(time_std), !is.na(severity_total)
+  )
+
+```
+
+```{r}
+
+features <- c("F0", "F1", "F2", "F3")
+
+bams <- lapply(features, function(f) {
+  message("Fitting BAM for ", f)
+  bam(
+    as.formula(paste0(
+      f, " ~ ",
+      "s(time_std, k=8) + ",                     # time smooth
+      "s(severity_total, k=6) + ",              # severity smooth
+      "ti(time_std, severity_total, k=c(6,5)) + ", # interaction
+      "gender + gender:severity_total"          # gender effects
+    )),
+    data = sample_10,
+    method = "fREML",
+    discrete = TRUE
+  )
+})
+
+names(bams) <- features
+
+```
+
+```{r plotting}
+
+# Base plot for F0 BAM
+plot(bams$F0, pages = 1, scheme = 2, rug = FALSE)
+
+# Or ggplot with predict()
+library(ggplot2)
+
+# Create prediction grid
+pred_data <- expand.grid(
+  time_std = seq(min(sample_10$time_std), max(sample_10$time_std), length.out = 100),
+  severity_total = mean(sample_10$severity_total, na.rm = TRUE),
+  gender = levels(sample_10$gender)
+)
+
+preds <- predict(bams$F0, newdata = pred_data, se.fit = TRUE)
+pred_data$fit <- preds$fit
+pred_data$se <- preds$se.fit
+
+ggplot(pred_data, aes(x = time_std, y = fit, color = gender, fill = gender)) +
+  geom_line(size=1) +
+  geom_ribbon(aes(ymin=fit-2*se, ymax=fit+2*se), alpha=0.2) +
+  theme_minimal() +
+  labs(title="F0 BAM smooths by gender", x="Time (standardized)", y="F0")
+
+#for this one it didn't generate because it said the graph margins are too large 
+```
+
+##Trial 2
+
+```{r load}
+
+install.packages("arrow", type = "binary")  # for updated version
+
+library(arrow)  
+library(dplyr)
+library(mgcv)
+library(ggplot2)
+
+```
+
+
+
+```{r 10% sample}
+
+sample_10 <- open_dataset("C:/Users/teger/Downloads/50_data_demo_mds.parquet")
+
+# get row count (streaming, safe)
+n <- sample_10 %>% summarise(n = n()) %>% collect() %>% pull(n)
+
+sample_10 <- sample_10 %>%
+  head(floor(0.10 * n)) %>%
+  collect()
+```
+
+```{r filter + collect}
+
+
+sample_10 <- sample_10 %>%
+  select(
+    recordId, time, F0, F1, F2, F3, gender, healthCode,
+    recordId_demo, recordId_mds,
+    `MDS-UPDRS1.1`, `MDS-UPDRS1.3`, `MDS-UPDRS1.4`,
+    `MDS-UPDRS1.5`, `MDS-UPDRS1.7`, `MDS-UPDRS1.8`,
+    `MDS-UPDRS2.1`, `MDS-UPDRS2.4`, `MDS-UPDRS2.5`,
+    `MDS-UPDRS2.6`, `MDS-UPDRS2.7`, `MDS-UPDRS2.8`,
+    `MDS-UPDRS2.9`, `MDS-UPDRS2.10`, `MDS-UPDRS2.12`,
+    `MDS-UPDRS2.13`
+  ) %>%
+  collect()
+```
+
+```{r calculate severity scores}
+
+sample_10 <- sample_10 %>%
+  mutate(
+    MDS_UPDRS1_total = rowSums(
+      across(starts_with("MDS-UPDRS1")),
+      na.rm = TRUE
+    ),
+    MDS_UPDRS2_total = rowSums(
+      across(starts_with("MDS-UPDRS2")),
+      na.rm = TRUE
+    )
+  
+  )
+```
+
+```{r check}
+
+colnames(sample_10)
+
+```
+
+
+```{r cleaning}
+
+#removing the MDS columns now that I have the sums for MDS1 and 2
+
+sample_10 %>%
+  select(
+    recordId, time, F0, F1, F2, F3, gender, healthCode,
+    recordId_demo, recordId_mds, MDS_UPDRS1_total, MDS_UPDRS2_total)
+
+```
+
+```{r variable prep}
+
+sample_10 <- sample_10 %>%
+  mutate(
+    gender = factor(gender),
+    time_std = as.numeric(scale(time)),
+    severity_total = as.numeric(MDS_UPDRS1_total + MDS_UPDRS2_total)
+  ) %>%
+  filter(
+    !is.na(F0), !is.na(F1), !is.na(F2), !is.na(F3),
+    !is.na(time_std), !is.na(severity_total)
+  )
+#chatgpt kept telling me it would be easier if i added the severity scores together for now
+```
+
+```{r find minimal sample size}
+#wanted to find smallest sample size i could take that would still work with running analysis
+
+
+k_time <- 8
+k_severity <- 6
+n_gender <- length(unique(sample_10$gender))
+
+# Rule of thumb: 10 * max(k) * n_gender
+min_rows <- ceiling(10 * max(k_time, k_severity) * n_gender)
+cat("Minimal rows needed:", min_rows, "\n")
+
+```
+
+```{r taking minimal sample by gender}
+
+set.seed(123)
+sample_min <- sample_10 %>%
+  group_by(gender) %>%
+  slice_sample(n = ceiling(min_rows / n_gender)) %>%
+  ungroup()
+
+gc()  # free memory
+```
+
+```{r fit BAM}
+#was advised to use BAM instead of GAM for memory efficiency 
+fit_bam <- function(feature, data) {
+  bam(
+    as.formula(paste0(
+      feature, " ~ ",
+      "s(time_std, k=", k_time, ") + ",
+      "s(severity_total, k=", k_severity, ") + ",
+      "ti(time_std, severity_total, k=c(", k_time-2, ",", k_severity-1, ")) + ",
+      "gender + gender:severity_total"
+    )),
+    data = data,
+    method = "fREML",
+    discrete = TRUE
+  )
+}
+
+```
+
+```{r F0-3 BAM fit}
+
+
+features <- c("F0", "F1", "F2", "F3")
+
+bams <- lapply(features, function(f) {
+  message("Fitting BAM for ", f)
+  fit_bam(f, sample_min)
+})
+names(bams) <- features
+
+```
+```{r BAM plot function}
+
+plot_bam_smooth <- function(bam_model, feature_name, data) {
+  pred_data <- expand.grid(
+    time_std = seq(min(data$time_std), max(data$time_std), length.out = 100),
+    severity_total = mean(data$severity_total),
+    gender = levels(data$gender)
+  )
+  
+  preds <- predict(bam_model, newdata = pred_data, se.fit = TRUE)
+  pred_data$fit <- preds$fit
+  pred_data$se  <- preds$se.fit
+  
+  ggplot(pred_data, aes(x = time_std, y = fit, color = gender, fill = gender)) +
+    geom_line(size=1) +
+    geom_ribbon(aes(ymin=fit-2*se, ymax=fit+2*se), alpha=0.2, color = NA) +
+    theme_minimal() +
+    labs(
+      title = paste0(feature_name, " BAM smooths by gender"),
+      x = "Time (standardized)",
+      y = feature_name
+    )
+}
+```
+
+```{r Plot}
+
+plots <- lapply(features, function(f) plot_bam_smooth(bams[[f]], f, sample_min))
+
+#everything was going good up til here :(
+
+
+```
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
