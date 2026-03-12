@@ -1,0 +1,360 @@
+---
+title: "Acoustic Data Normalization"
+output: html_document
+date: "2026-02-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+```{r load}
+library(arrow)
+library(dplyr)
+library(tidyverse)
+```
+```{r csv paths}
+
+mds_csv_path      <- "~/Downloads/data_demo_mds (1).csv"
+
+tts_positive_path <- "~/Downloads/positive_tts.csv"
+tts_negative_path <- "~/Downloads/negative_tts.csv"
+
+parquet_pos_path  <- "~/Downloads/positive.parquet"
+parquet_neg_path  <- "~/Downloads/negative.parquet"
+
+
+```
+
+
+```{r 10% sample}
+
+ds <- read_csv_arrow(mds_csv_path)
+
+# get row count (streaming, safe)
+n <- ds %>% summarise(n = n()) %>% collect() %>% pull(n)
+
+sample_10 <- ds %>%
+  head(floor(0.1 * n)) %>%
+  collect()
+```
+
+```{r check}
+
+colnames(sample_10)
+
+``` 
+
+```{r collect}
+sample_10 <- sample_10 %>%
+  group_by(recordId) %>%
+  ungroup() %>%
+  select(
+    recordId, age, gender, healthCode, recordId_mds,
+    `MDS-UPDRS1.1`, `MDS-UPDRS1.3`, `MDS-UPDRS1.4`,
+    `MDS-UPDRS1.5`, `MDS-UPDRS1.7`, `MDS-UPDRS1.8`,
+    `MDS-UPDRS2.1`, `MDS-UPDRS2.4`, `MDS-UPDRS2.5`,
+    `MDS-UPDRS2.6`, `MDS-UPDRS2.7`, `MDS-UPDRS2.8`,
+    `MDS-UPDRS2.9`, `MDS-UPDRS2.10`, `MDS-UPDRS2.12`,
+    `MDS-UPDRS2.13`
+  ) %>%
+  collect()
+```
+
+```{r severity score calculation}
+
+sample_10 <- sample_10 %>%
+  mutate(
+    MDS_UPDRS1_total = rowSums(
+      across(starts_with("MDS-UPDRS1")),
+      na.rm = TRUE
+    ),
+    MDS_UPDRS2_total = rowSums(
+      across(starts_with("MDS-UPDRS2")),
+      na.rm = TRUE
+    )
+  
+  )
+```
+
+```{r clean}
+
+sample_10 <- sample_10%>%
+  select( recordId, age, gender, healthCode, recordId_mds, MDS_UPDRS1_total, MDS_UPDRS2_total)
+          
+          
+```
+
+
+
+```{r read csv}
+
+tts_pos <- read.csv(tts_positive_path)
+tts_neg <- read.csv(tts_negative_path)
+```
+
+```{r read parquet}
+
+pos <- read_parquet(parquet_pos_path)
+neg <- read_parquet(parquet_neg_path)
+```
+
+```{r add label}
+
+tts_pos <- tts_pos %>% mutate(diagnosis = "positive")
+tts_neg <- tts_neg %>% mutate(diagnosis = "negative")
+
+pos <- pos %>% mutate(diagnosis = "positive")
+neg <- neg %>% mutate(diagnosis = "negative")
+
+```
+
+```{r combine}
+
+tts_all <- bind_rows(tts_pos, tts_neg)
+acoustic_all <- bind_rows(pos, neg)
+
+```
+
+```{r sum}
+
+tts_summary <- tts_all %>%
+  group_by(healthCode) %>%
+  summarise(
+    time_to_stabilization_s =
+      mean(time_to_stabilization_s, na.rm = TRUE),
+    diagnosis = first(diagnosis),
+    .groups = "drop"
+  )
+
+```
+
+```{r collapse}
+mds_summary <- sample_10 %>%
+  group_by(healthCode) %>%
+  summarise(
+    age = first(age),
+    gender = first(gender),
+    MDS_UPDRS1_total = mean(MDS_UPDRS1_total, na.rm = TRUE),
+    MDS_UPDRS2_total = mean(MDS_UPDRS2_total, na.rm = TRUE),
+    n_mds_visits = n(),
+    .groups = "drop"
+  )
+```
+
+```{r merge}
+
+df <- acoustic_all %>%
+  left_join(tts_summary, by = "healthCode") %>%
+  left_join(mds_summary, by = "healthCode")
+
+```
+
+```{r average}
+
+acoustic_summary <- acoustic_all %>%
+  group_by(healthCode) %>%
+  summarise(
+    F0_mean = mean(F0, na.rm = TRUE),
+    F1_mean = mean(F1, na.rm = TRUE),
+    F2_mean = mean(F2, na.rm = TRUE),
+    F3_mean = mean(F3, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+```{r z-score calculation}
+
+acoustic_deltaF <- acoustic_summary %>%
+  mutate(
+    dF1 = log(F1_mean) - log(F0_mean),
+    dF2 = log(F2_mean) - log(F0_mean),
+    dF3 = log(F3_mean) - log(F0_mean)
+  )
+
+```
+
+```{r remerge}
+
+df <- df %>%
+  left_join(
+    acoustic_deltaF %>%
+      select(healthCode, gender, dF1, dF2, dF3),
+    by = "healthCode"
+  )
+
+```
+
+```{r df check}
+colnames(df)
+
+```
+```{r install}
+
+library("dplyr")
+library("tidyr")
+library("ggplot2")
+
+```
+
+```{r plot df prep}
+
+
+plot_df <- acoustic_deltaF %>%
+  left_join(
+    df %>%
+      select(healthCode, MDS_UPDRS2_total),
+    by = "healthCode"
+  ) %>%
+  filter(!is.na(gender), !is.na(age), !is.na(MDS_UPDRS2_total))
+
+```
+
+
+```{r frequency fomratting}
+
+plot_long <- plot_df %>%
+ select(healthCode, gender, age, MDS_UPDRS2_total,
+       dF1, dF2, dF3) %>%
+  pivot_longer(
+    cols = starts_with("d"),
+    names_to = "formant",
+    values_to = "z_value"
+  )
+
+```
+
+```{r severity define}
+
+
+plot_long <- plot_long %>%
+  mutate(
+    severity_group = cut(
+      MDS_UPDRS2_total,
+      breaks = c(-Inf, 10, 20, 30, Inf),
+      labels = c("mild", "moderate", "moderate-severe", "severe")
+    )
+  )
+
+```
+
+```{r density plot}
+
+
+ggplot(plot_long,
+       aes(x = z_value,
+           fill = gender,
+           colour = gender)) +
+  geom_density(alpha = 0.25) +
+  facet_grid(formant ~ severity_group) +
+  theme_minimal() +
+  labs(
+    x = "Z-scored formant value",
+    y = "Density",
+    title = "Distribution of F0–F3 by Gender and Severity"
+  )
+
+```
+
+```{r violin plot}
+
+ggplot(plot_long,
+       aes(x = severity_group,
+           y = z_value,
+           fill = gender)) +
+  geom_violin(trim = FALSE, alpha = 0.6) +
+  facet_wrap(~ formant, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    x = "Severity group",
+    y = "Z-score",
+    title = "Formant distributions by Gender and Disease Severity"
+  )
+
+```
+
+```{r reload}
+
+
+install.packages(c(
+  "rlang",
+  "vctrs",
+  "tidyselect",
+  "dplyr",
+  "tidyr",
+  "ggplot2"
+))
+
+```
+
+```{r load}
+
+library(rlang)
+library(tidyselect)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(vctrs)
+
+
+```
+
+```{r continuous plot}
+
+ggplot(plot_long,
+       aes(x = MDS_UPDRS2_total,
+           y = z_value,
+           colour = gender)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ formant, scales = "free_y") +
+  theme_minimal()
+  
+```
+
+
+#add age as a factor in continous plot
+```{r age groupings}
+
+plot_long <- plot_long %>%
+  mutate(
+    age_group = cut(
+      age,
+      breaks = c(-Inf, 40, 50, 60, 70, 80, Inf),
+      labels = c("<40", "40–49", "50–59", "60–69", "70–79", "80+")
+    )
+  )
+
+```
+
+```{r plot with age}
+
+ggplot(plot_long,
+       aes(x = MDS_UPDRS2_total,
+           y = z_value,
+           colour = gender)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_grid(formant ~ age_group) +
+  theme_minimal() +
+  labs(
+    x = "MDS-UPDRS2 severity",
+    y = "Normalized formant value",
+    title = "Formant change with severity by age group"
+  )
+
+```
