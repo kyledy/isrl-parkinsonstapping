@@ -1,0 +1,254 @@
+---
+title: "50 GAM Trials"
+output: html_document
+date: "2026-01-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+##Trial 1a
+
+
+```{r load}
+library(arrow)
+library(dplyr)
+library(tidyverse)
+```
+
+
+```{r 10% sample}
+
+ds <- open_dataset("D:/50_data_demo_mds.parquet")
+
+# get row count (streaming, safe)
+n <- ds %>% summarise(n = n()) %>% collect() %>% pull(n)
+
+sample_10 <- ds %>%
+  head(floor(1 * n)) %>%
+  collect()
+```
+
+```{r collect}
+sample_10 <- sample_10 %>%
+  group_by(recordId) %>%
+  mutate(
+    time_std = (time - min(time, na.rm=TRUE)) / (max(time, na.rm=TRUE) - min(time, na.rm=TRUE))
+  ) %>%
+  ungroup() %>%
+  select(
+    recordId, time_std, F0, F1, F2, F3, age, gender, healthCode,
+    recordId_demo, recordId_mds,
+    `MDS-UPDRS1.1`, `MDS-UPDRS1.3`, `MDS-UPDRS1.4`,
+    `MDS-UPDRS1.5`, `MDS-UPDRS1.7`, `MDS-UPDRS1.8`,
+    `MDS-UPDRS2.1`, `MDS-UPDRS2.4`, `MDS-UPDRS2.5`,
+    `MDS-UPDRS2.6`, `MDS-UPDRS2.7`, `MDS-UPDRS2.8`,
+    `MDS-UPDRS2.9`, `MDS-UPDRS2.10`, `MDS-UPDRS2.12`,
+    `MDS-UPDRS2.13`
+  ) %>%
+  collect()
+```
+
+```{r rename}
+
+sample_10 <- sample_10 %>%
+  mutate(
+    MDS_UPDRS1_total = rowSums(
+      across(starts_with("MDS-UPDRS1")),
+      na.rm = TRUE
+    ),
+    MDS_UPDRS2_total = rowSums(
+      across(starts_with("MDS-UPDRS2")),
+      na.rm = TRUE
+    )
+  
+  )
+```
+
+```{r cleaning}
+
+sample_10 %>%
+  select(
+    recordId, time, F0, F1, F2, F3, gender, healthCode,
+    recordId_demo, recordId_mds, MDS_UPDRS1_total, MDS_UPDRS2_total,
+    age)
+
+sample_10$time %>% min()
+```
+
+
+```{r sanity filter}
+library(mgcv)
+
+
+sample_10 <- sample_10 %>%
+  mutate(
+    gender = factor(gender),
+    severity1 = as.numeric(MDS_UPDRS1_total),
+    severity2 = as.numeric(MDS_UPDRS2_total),
+    severity_total = severity1 + severity2,
+    time_std = as.numeric(time_std)
+  ) %>%
+  filter(
+    !is.na(time),
+    !is.na(gender),
+    !is.na(severity1),
+    !is.na(severity2)
+  )
+```
+
+```{r fit}
+
+library(mgcv)
+
+
+sample_10 <- sample_10 %>%
+  mutate(
+    gender = factor(gender),
+    time_std = as.numeric(scale(time)),
+    severity_total = as.numeric(severity_total)
+  )
+
+gam_F0 <- bam(
+  F0 ~ gender + 
+    s(time_std, k = 8, bs = "cr") +      # "cr" = cubic regression spline
+    s(severity_total, k = 6, bs = "cr") + 
+    ti(time_std, severity_total, k = c(5, 4), bs = "cr") + 
+    gender:severity_total,
+  data     = sample_10,
+  method   = "fREML",
+  discrete = TRUE
+)
+```
+
+
+
+##Trial 1b
+
+```{r bam replacement for memory efficiency}
+
+
+features <- c("F0", "F1", "F2", "F3")
+
+bams <- lapply(features, function(f) {
+  bam(
+    as.formula(paste0(
+      f, " ~ s(time_std, k=8) + ",
+      "s(severity_total, k=6) + ",
+      "ti(time_std, severity_total, k=c(6,5)) + ",
+      "gender + gender:severity_total + ",
+      "age"
+    )),
+    data = sample_10,
+    method = "fREML",
+    discrete = TRUE
+  )
+})
+
+names(bams) <- features
+
+```
+
+
+```{r prep}
+
+
+library(mgcv)
+
+sample_10 <- sample_10 %>%
+  mutate(
+    gender = factor(gender),
+    time_std = as.numeric(scale(time)),
+    severity_total = as.numeric(severity_total)
+  ) %>%
+  filter(
+    !is.na(F0), !is.na(F1), !is.na(F2), !is.na(F3),
+    !is.na(time_std), !is.na(severity_total)
+  )
+
+```
+
+```{r}
+
+features <- c("F0", "F1", "F2", "F3")
+
+bams <- lapply(features, function(f) {
+  message("Fitting BAM for ", f)
+  bam(
+    as.formula(paste0(
+      f, " ~ ",
+      "s(time_std, k=8) + ",                     # time smooth
+      "s(severity_total, k=6) + ",              # severity smooth
+      "ti(time_std, severity_total, k=c(6,5)) + ", # interaction
+      "gender + gender:severity_total + ",
+      "age" # gender effects
+    )),
+    data = sample_10,
+    method = "fREML",
+    discrete = TRUE
+  )
+})
+
+names(bams) <- features
+
+```
+
+```{r plotting}
+
+# Base plot for F0 BAM
+plot(bams$F0, pages = 1, scheme = 2, rug = FALSE)
+
+# Or ggplot with predict()
+library(ggplot2)
+
+# Create prediction grid
+pred_data <- expand.grid(
+  # Hold time steady at the midpoint (0.5) to see the pure effect of severity
+  time_std = 0.5, 
+  # Let severity vary across the full observed range
+  severity_total = seq(min(sample_10$severity_total, na.rm = TRUE), 
+                       max(sample_10$severity_total, na.rm = TRUE), 
+                       length.out = 100),
+  gender = levels(sample_10$gender)
+)
+
+# 2. Generate Predictions
+preds <- predict(bams$F0, newdata = pred_data, se.fit = TRUE)
+pred_data$fit <- preds$fit
+pred_data$se  <- preds$se.fit
+
+# 3. Plot: F0 vs Severity Total
+ggplot(pred_data, aes(x = severity_total, y = fit, color = gender, fill = gender)) +
+  geom_ribbon(aes(ymin = fit - 2*se, ymax = fit + 2*se), alpha = 0.2, color = NA) +
+  geom_line(size = 1.2) +
+  # Separate by gender for clearer comparison of the slopes
+  facet_wrap(~gender) + 
+  theme_minimal() +
+  labs(
+    title = "Effect of Disease Severity on F0",
+    subtitle = "Predictions held at median recording time (time_std = 0.5)",
+    x = "Severity Total (MDS-UPDRS)",
+    y = "Predicted F0 (Hz)"
+  ) +
+  theme(legend.position = "none")
+#for this one it didn't generate because it said the graph margins are too large 
+```
